@@ -1,0 +1,43 @@
+{
+  "name": "dantonio-pi-meter",
+  "version": "0.2.0",
+  "description": "One subtle line above the Pi editor: session token totals (orchestrator + settled subagents) and live/session tokens per second. Differential-render friendly.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "gentle-shell-package",
+    "gentle-shell-extension",
+    "tokens",
+    "tps"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dantoniomarte/dantonio-pi-meter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dantoniomarte/dantonio-pi-meter/issues"
+  },
+  "homepage": "https://github.com/dantoniomarte/dantonio-pi-meter#readme",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/meter.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
