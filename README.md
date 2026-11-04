@@ -3,7 +3,7 @@
 One subtle line above the Pi editor.
 
 ```text
-in 93.6k · out 3.1k · cacheR 80k · cacheW 1.2k · 42 tok/s · avg 31 · +2 sa
+in 93.6k · out 3.1k · cacheR 80k · cacheW 1.2k · 42 tok/s · avg 31 · +2 sa @14
 ```
 
 - `in` is the full prompt volume: uncached input plus `cacheR` plus `cacheW`. This is the same number `/session-info` prints as **Input** for the orchestrator session file, so the line reconciles with that panel by construction.
@@ -11,7 +11,8 @@ in 93.6k · out 3.1k · cacheR 80k · cacheW 1.2k · 42 tok/s · avg 31 · +2 sa
 - `out` is provider-reported output. `in` `out` `cacheR` `cacheW` cover the orchestrator plus every settled subagent.
 - `tok/s` is the live decode rate of the current orchestrator response. It is a character-stream estimate (about 4 characters per token), shown only while text is arriving.
 - `avg` is the session average: reported orchestrator output tokens divided by measured orchestrator generation time.
-- `+N sa` counts settled subagents folded into the totals.
+- `+N sa` counts settled subagents folded into the totals. When subagent task
+  throughput is measurable it rides the marker as `+N sa @R`.
 
 ## Reconciling with `/session-info`
 
@@ -33,7 +34,15 @@ The line is cached. It is rebuilt at most four times per second while the orches
 
 ## Limits
 
-Subagent events report tokens but not generation duration, so subagent time cannot move `avg`. Their tokens are included in the totals when the task settles. The relay may omit `cacheWrite`; an absent field renders as 0, never as a guess.
+Subagent events report tokens and task wall time (`launchedAt` to settle) but
+no generation duration, so the two decode metrics stay orchestrator-only: live
+tok/s and `avg` never include subagents. The `@R` beside the count marker is
+**task throughput**, a different unit: total subagent output tokens divided by
+total settled task wall time. Task time includes queueing, thinking and tool
+execution, so `@R` reads lower than a decode rate and belongs to no model — it
+answers "how fast do my subagents finish work", not "how fast does the model
+decode". The relay may omit `cacheWrite`; an absent field renders as 0, never
+as a guess.
 
 ## Install
 

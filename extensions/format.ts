@@ -54,14 +54,19 @@ export interface MeterView {
 	live?: number;
 	/** Session average: total output tokens / measured generation seconds. */
 	average?: number;
+	/** Aggregate subagent task throughput: output tokens / settled wall seconds. */
+	subagentRate?: number;
 }
 
 /**
  * One line, dim, stable width for a given set of numbers.
- * Example: `in 93.6k · out 3.1k · cacheR 80k · cacheW 1.2k · 42 tok/s · avg 31 · +2 sa`
+ * Example: `in 93.6k · out 3.1k · cacheR 80k · cacheW 1.2k · 42 tok/s · avg 31 · +2 sa @14`
  *
  * `in` is the full prompt volume (uncached + cacheRead + cacheWrite), the same
  * number /session-info prints as Input; cacheR/cacheW are its cached split.
+ * `+N sa @R` folds the count marker with the subagent task throughput: R is
+ * output tokens over settled task wall time, so tool execution inside a task
+ * slows it. It is not a decode rate.
  */
 export function renderLine(view: MeterView): string {
 	const { totals } = view;
@@ -74,6 +79,9 @@ export function renderLine(view: MeterView): string {
 		`${formatRate(view.live)} tok/s`,
 		`avg ${formatRate(view.average)}`,
 	];
-	if (view.subagents > 0) parts.push(`+${view.subagents} sa`);
+	if (view.subagents > 0) {
+		const rate = view.subagentRate !== undefined ? ` @${formatRate(view.subagentRate)}` : "";
+		parts.push(`+${view.subagents} sa${rate}`);
+	}
 	return parts.join(" · ");
 }

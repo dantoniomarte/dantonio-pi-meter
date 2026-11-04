@@ -139,6 +139,56 @@ test("dropChild removes a revoked subagent from the totals", () => {
 	assert.equal(dropChild(state, "never-seen"), false);
 });
 
+test("a child's wall time feeds the subagent task throughput", () => {
+	const state = createState();
+	// Task 1: 600 output tokens over 3,000 ms of wall time -> 200 tok/s.
+	noteChild(state, childEvent("task-1", { output: { state: "reported", value: 600 } }), 5_000, 2_000);
+	// Task 2: 240 output tokens over 2,000 ms -> 120 tok/s. Aggregate:
+	// 840 tokens / 5,000 ms = 168 tok/s (total over total, not the mean).
+	noteChild(state, childEvent("task-2", { output: { state: "reported", value: 240 } }), 4_000, 2_000);
+	assert.equal(state.subagentMs, 5_000);
+	assert.equal(rates(state, 0).subagent, 168);
+});
+
+test("subagent throughput drops with the revoked task's tokens and time", () => {
+	const state = createState();
+	noteChild(state, childEvent("task-1", { output: { state: "reported", value: 600 } }), 5_000, 2_000);
+	noteChild(state, childEvent("task-2", { output: { state: "reported", value: 240 } }), 4_000, 2_000);
+	assert.equal(dropChild(state, "task-1"), true);
+	assert.equal(state.subagentMs, 2_000);
+	assert.equal(rates(state, 0).subagent, 120);
+});
+
+test("a replacement snapshot replaces wall time instead of stacking it", () => {
+	const state = createState();
+	noteChild(state, childEvent("task-1", { output: { state: "reported", value: 600 } }), 5_000, 2_000);
+	// Re-delivery with a fresh settledAt and more tokens: the stored window is
+	// replaced, never added to (stacking would make subagentMs 6,000).
+	noteChild(state, childEvent("task-1", { output: { state: "reported", value: 900 } }), 9_000, 6_000);
+	assert.equal(state.subagentMs, 3_000);
+	assert.equal(rates(state, 0).subagent, 300);
+});
+
+test("subagent throughput is undefined without settled tasks or wall time", () => {
+	const state = createState();
+	assert.equal(rates(state, 0).subagent, undefined);
+	// A degenerate window (settle at launch, or settle before launch) stores no
+	// time, so the rate stays undefined even with tokens present.
+	noteChild(state, childEvent("task-1", { output: { state: "reported", value: 600 } }), 5_000, 5_000);
+	assert.equal(state.subagentMs, 0);
+	noteChild(state, childEvent("task-2", { output: { state: "reported", value: 600 } }), 4_000, 5_000);
+	assert.equal(rates(state, 0).subagent, undefined);
+});
+
+test("renderLine shows subagent throughput beside the count marker", () => {
+	const line = renderLine({ totals: zero, subagents: 2, subagentRate: 14.2 });
+	assert.match(line, /\+2 sa @14\.2/);
+	// Count-only stays in the old shape.
+	const countOnly = renderLine({ totals: zero, subagents: 2 });
+	assert.match(countOnly, /\+2 sa$/);
+	assert.equal(countOnly.includes("@"), false);
+});
+
 test("foldEntries seeds parent totals from a resumed session's entries", () => {
 	const state = createState();
 	const entries: unknown[] = [

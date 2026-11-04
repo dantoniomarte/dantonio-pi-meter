@@ -1,6 +1,6 @@
 {
   "name": "dantonio-pi-meter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "One subtle line above the Pi editor: session token totals (orchestrator + settled subagents) and live/session tokens per second. Differential-render friendly.",
   "type": "module",
   "license": "MIT",

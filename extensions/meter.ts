@@ -2,7 +2,8 @@
  * dantonio-pi-meter — one subtle line above the editor.
  *
  * Shows session totals (orchestrator + settled subagents) for input, output,
- * cache read and cache write, plus a live tokens/second and a session average.
+ * cache read and cache write, plus a live tokens/second, a session average,
+ * and the settled-subagent task throughput beside the count marker.
  *
  * Render cost: the line is a cached string. It is rebuilt at most 4 times per
  * second while the parent streams, once when a response or subagent settles,
@@ -35,6 +36,12 @@ interface AssistantEvent {
 
 interface CompactEvent {
 	compactionEntry?: { usage?: Partial<MeterState["parent"]> };
+}
+
+interface ChildMetricsEvent {
+	taskId: string;
+	launchedAt?: number;
+	responses: unknown[];
 }
 
 const CHILD_METRICS_EVENT = "gentle:runtime-metrics:child/v1";
@@ -130,7 +137,10 @@ export default function meterExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.events?.on?.(CHILD_METRICS_EVENT, (value: unknown) => {
-		if (noteChild(state, value)) paint(true);
+		const event = value as ChildMetricsEvent | null;
+		// Task throughput uses the settle moment as the right edge of the
+		// launch->settle wall-time window.
+		if (noteChild(state, value, Date.now(), event?.launchedAt)) paint(true);
 	});
 
 	pi.events?.on?.(CHILD_METRICS_REVOKED, (taskId: unknown) => {
