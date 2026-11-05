@@ -44,6 +44,51 @@ answers "how fast do my subagents finish work", not "how fast does the model
 decode". The relay may omit `cacheWrite`; an absent field renders as 0, never
 as a guess.
 
+## Subscription usage panel (alt+u)
+
+The meter also feeds Gentle Shell's usage panel (`alt+u` or `/gentle:usage`)
+with subscription usage from the providers below. A source appears in the
+panel only when the session targets that provider (the active provider or
+one named by the active profile's subagent routing) and its API key is
+configured in Pi; nothing is fetched otherwise.
+
+| Provider | Usage data | Source |
+| --- | --- | --- |
+| Anthropic (Claude) | rate-limit windows | built into Gentle Shell |
+| OpenAI Codex | rate-limit windows | built into Gentle Shell |
+| nan | quota | built into Gentle Shell |
+| torogoz | 7-day totals + per-model quotas | this package |
+| OpenCode Go | rolling 5h / weekly / monthly windows | this package |
+| OpenRouter | key credit limit + budget windows | this package |
+| your router | whatever its API exposes | this package (custom, see below) |
+
+Gemini (AI Studio / Vertex / Code Assist) and CommandCode's own plan expose
+no public usage API, so no honest row exists for them; their BYOK traffic
+shows up under the underlying provider (OpenRouter, etc.). OpenRouter's
+deprecated `rate_limit` object is ignored on purpose.
+
+### Custom providers
+
+Any bearer-authenticated endpoint whose response matches one of the shipped
+mapper styles can be added in settings, no code:
+
+```json
+"dantonio-pi-meter": {
+  "usageProviders": [
+    { "provider": "myrouter", "url": "https://api.myrouter.com/api/v1/key", "style": "openrouter" },
+    { "provider": "gw", "url": "https://gw.example.org/v1/usage?days=7", "style": "usage_summary" }
+  ]
+}
+```
+
+- `provider` must be the session's provider id — that is how the shell
+  resolves the API key and decides to show the row.
+- `style` picks the response mapper: `openrouter` (the `GET /api/v1/key`
+  shape, the de-facto router standard), `usage_summary` (torogoz-style
+  quota rows), or `opencode-go` (rolling/weekly/monthly percent windows).
+- Malformed entries are dropped; a broken custom provider never takes the
+  session down.
+
 ## Install
 
 ```bash

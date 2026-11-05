@@ -1,16 +1,18 @@
 {
   "name": "dantonio-pi-meter",
-  "version": "0.3.0",
-  "description": "One subtle line above the Pi editor: session token totals (orchestrator + settled subagents) and live/session tokens per second. Differential-render friendly.",
+  "version": "0.4.0",
+  "description": "One subtle line above the Pi editor: session token totals (orchestrator + settled subagents), live/session tokens per second, and subscription usage sources for the alt+u panel (torogoz, OpenCode Go, OpenRouter, custom).",
   "type": "module",
   "license": "MIT",
   "keywords": [
-    "pi-package",
-    "pi-coding-agent",
-    "gentle-shell-package",
     "gentle-shell-extension",
+    "gentle-shell-package",
+    "pi-coding-agent",
+    "pi-package",
+    "subscription-usage",
     "tokens",
-    "tps"
+    "tps",
+    "usage"
   ],
   "repository": {
     "type": "git",
