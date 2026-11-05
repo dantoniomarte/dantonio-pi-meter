@@ -20,6 +20,11 @@ import {
 	translateTorogozUsage,
 } from "../extensions/usage-torogoz.ts";
 import { registerUsageSources } from "../extensions/usage-registry.ts";
+import {
+	customUsageProviders,
+	registerCustomUsageSources,
+	type CustomUsageProviderConfig,
+} from "../extensions/usage-custom.ts";
 
 const NOW = Date.parse("2026-10-27T12:00:00Z");
 const DAY = 86_400_000;
@@ -188,21 +193,48 @@ test("openrouter: payloads without any data answer undefined, never throw", () =
 });
 
 // ---------------------------------------------------------------------------
-// registry
+// custom providers (settings: dantonio-pi-meter.usageProviders)
 // ---------------------------------------------------------------------------
 
-test("registerUsageSources registers torogoz, opencode and openrouter exactly once", () => {
-	const emitted: Array<{ event: string; payload: Record<string, unknown> }> = [];
-	registerUsageSources({ emit: (event, payload) => emitted.push({ event, payload: payload as Record<string, unknown> }) });
-	assert.equal(emitted.length, 3);
-	assert.deepEqual(emitted.map((e) => e.payload.provider), ["torogoz", "opencode", "openrouter"]);
-	for (const { event, payload } of emitted) {
-		assert.equal(event, USAGE_SOURCE_EVENT);
-		assert.equal(payload.schema, USAGE_SOURCE_SCHEMA);
-		assert.equal(typeof payload.fetch, "function");
-	}
-	assert.equal(USAGE_SOURCE_EVENT, "gentle-pi:usage-source/v1");
-	assert.equal(USAGE_SOURCE_SCHEMA, "gentle-pi.usage-source/v1");
+test("customUsageProviders keeps valid entries and drops malformed ones", () => {
+	const raw = {
+		usageProviders: [
+			{ provider: "myrouter", url: "https://api.myrouter.com/v1/usage", style: "openrouter" },
+			{ provider: "torogoz-like", url: "https://gw.example.org/v1/usage", style: "usage_summary" },
+			{ url: "https://no-provider.example/v1/usage", style: "openrouter" },
+			{ provider: "bad-url", url: "ftp://nope", style: "openrouter" },
+			{ provider: "bad-style", url: "https://ok.example/v1/usage", style: "anthropic" },
+			"junk",
+		],
+	};
+	const parsed = customUsageProviders(raw);
+	assert.deepEqual(parsed.map((c) => c.provider), ["myrouter", "torogoz-like"]);
+	assert.equal(parsed[0].style, "openrouter");
+	assert.equal(parsed[1].style, "usage_summary");
+});
+
+test("customUsageProviders tolerates absent or foreign settings", () => {
+	assert.deepEqual(customUsageProviders(undefined), []);
+	assert.deepEqual(customUsageProviders({}), []);
+	assert.deepEqual(customUsageProviders({ usageProviders: "junk" }), []);
+});
+
+test("registerCustomUsageSources emits one bearer source per valid entry", () => {
+	const emitted: Array<Record<string, unknown>> = [];
+	const config: CustomUsageProviderConfig[] = [
+		{ provider: "myrouter", url: "https://api.myrouter.com/api/v1/key", style: "openrouter" },
+	];
+	registerCustomUsageSources({ emit: (_e, payload) => emitted.push(payload as Record<string, unknown>) }, config);
+	assert.equal(emitted.length, 1);
+	assert.equal(emitted[0].provider, "myrouter");
+	assert.equal(emitted[0].schema, USAGE_SOURCE_SCHEMA);
+	assert.equal(typeof emitted[0].fetch, "function");
+});
+
+test("registerUsageSources stays built-in only when settings carry no custom entries", () => {
+	const emitted: Array<Record<string, unknown>> = [];
+	registerUsageSources({ emit: (e, payload) => emitted.push(payload as Record<string, unknown>) });
+	assert.deepEqual(emitted.map((e) => e.provider), ["torogoz", "opencode", "openrouter"]);
 });
 
 test("every source fetch answers undefined without a key, on HTTP failure and on junk", async () => {

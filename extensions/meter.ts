@@ -15,6 +15,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { addUsage, renderLine } from "./format.ts";
 import { registerUsageSources } from "./usage-registry.ts";
+import { customUsageProviders, registerCustomUsageSources } from "./usage-custom.ts";
 import {
 	createState,
 	dropChild,
@@ -102,8 +103,15 @@ export default function meterExtension(pi: ExtensionAPI): void {
 		}
 		// Usage sources re-register per session (the shell's no-op-replace
 		// pattern) and stay inert unless the session targets their provider.
+		// Settings under the dantonio-pi-meter key add custom bearer sources
+		// on top of the built-in registry.
 		try {
 			registerUsageSources(pi.events);
+			const settings = typeof pi.getSettings === "function" ? pi.getSettings() : undefined;
+			const custom = customUsageProviders(
+				settings ? (settings as Record<string, unknown>)[WIDGET_KEY] : undefined,
+			);
+			registerCustomUsageSources(pi.events, custom);
 		} catch {
 			// A usage source must never take the session down.
 		}
