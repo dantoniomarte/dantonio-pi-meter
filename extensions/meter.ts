@@ -14,6 +14,7 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { addUsage, renderLine } from "./format.ts";
+import { registerUsageSources } from "./usage-registry.ts";
 import {
 	createState,
 	dropChild,
@@ -98,6 +99,13 @@ export default function meterExtension(pi: ExtensionAPI): void {
 			foldEntries(state, ctx.sessionManager.getEntries());
 		} catch {
 			// Bootstrap is best-effort; live events still accrue.
+		}
+		// Usage sources re-register per session (the shell's no-op-replace
+		// pattern) and stay inert unless the session targets their provider.
+		try {
+			registerUsageSources(pi.events);
+		} catch {
+			// A usage source must never take the session down.
 		}
 		paint(true);
 	});
