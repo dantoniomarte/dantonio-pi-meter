@@ -9,6 +9,9 @@
  * second while the parent streams, once when a response or subagent settles,
  * and never on a clock. The TUI diffs by line, so an unchanged string writes
  * nothing to the terminal.
+ *
+ * Subagent tokens are persisted as custom session entries at settle time and
+ * restored on session start, so resume and reload keep the child totals.
  */
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
@@ -17,14 +20,17 @@ import { addUsage, renderLine } from "./format.ts";
 import { registerUsageSources } from "./usage-registry.ts";
 import { customUsageProviders, registerCustomUsageSources } from "./usage-custom.ts";
 import {
+	CHILD_SNAPSHOT_TYPE,
 	createState,
 	dropChild,
 	endParentResponse,
+	foldChildEntries,
 	foldEntries,
 	noteChild,
 	noteDelta,
 	rates,
 	totals,
+	type ChildSnapshotData,
 	type MeterState,
 } from "./state.ts";
 
@@ -49,11 +55,32 @@ interface ChildMetricsEvent {
 const CHILD_METRICS_EVENT = "gentle:runtime-metrics:child/v1";
 const CHILD_METRICS_REVOKED = "gentle:runtime-metrics:revoked/v1";
 
+function persistChild(state: MeterState, taskId: string, appendEntry: (customType: string, data?: unknown) => void): void {
+	const snapshot = state.children.get(taskId);
+	if (!snapshot) return;
+	const data: ChildSnapshotData = {
+		taskId,
+		input: snapshot.input,
+		output: snapshot.output,
+		cacheRead: snapshot.cacheRead,
+		cacheWrite: snapshot.cacheWrite,
+	};
+	const wallMs = state.childrenMs.get(taskId);
+	if (wallMs !== undefined) data.wallMs = wallMs;
+	try {
+		appendEntry(CHILD_SNAPSHOT_TYPE, data);
+	} catch {
+		// Persistence is best-effort; the live line stays correct.
+	}
+}
+
 export default function meterExtension(pi: ExtensionAPI): void {
 	const state = createState();
 	let ctx: ExtensionContext | undefined;
 	let cached = "";
 	let timer: ReturnType<typeof setInterval> | undefined;
+
+	const appendEntry = typeof pi.appendEntry === "function" ? pi.appendEntry.bind(pi) : undefined;
 
 	function paint(force = false): void {
 		if (!ctx?.hasUI) return;
@@ -97,7 +124,11 @@ export default function meterExtension(pi: ExtensionAPI): void {
 		// A resumed or reloaded session must start from its full history, not
 		// from the moment this process came up.
 		try {
-			foldEntries(state, ctx.sessionManager.getEntries());
+			const entries = ctx.sessionManager.getEntries();
+			foldEntries(state, entries);
+			// Restores the child snapshots persisted at settle time, so the
+			// subagent totals survive resume and reload.
+			foldChildEntries(state, entries);
 		} catch {
 			// Bootstrap is best-effort; live events still accrue.
 		}
@@ -156,11 +187,19 @@ export default function meterExtension(pi: ExtensionAPI): void {
 		const event = value as ChildMetricsEvent | null;
 		// Task throughput uses the settle moment as the right edge of the
 		// launch->settle wall-time window.
-		if (noteChild(state, value, Date.now(), event?.launchedAt)) paint(true);
+		if (!noteChild(state, value, Date.now(), event?.launchedAt)) return;
+		if (appendEntry && event) persistChild(state, event.taskId, appendEntry);
+		paint(true);
 	});
 
 	pi.events?.on?.(CHILD_METRICS_REVOKED, (taskId: unknown) => {
-		if (typeof taskId === "string" && dropChild(state, taskId)) paint(true);
+		if (typeof taskId !== "string" || !dropChild(state, taskId)) return;
+		try {
+			appendEntry?.(CHILD_SNAPSHOT_TYPE, { taskId, revoked: true });
+		} catch {
+			// Persistence is best-effort; the live line stays correct.
+		}
+		paint(true);
 	});
 
 	pi.on("session_shutdown", async () => {

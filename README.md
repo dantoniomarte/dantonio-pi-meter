@@ -27,6 +27,11 @@ in 93.6k · out 3.1k · cacheR 80k · cacheW 1.2k · 42 tok/s · avg 31 · +2 sa
 - On `session_start` the meter folds the session's existing entries (assistant messages, summary tool results, compaction and branch summaries, standalone usage entries), so a resumed or reloaded session starts from its full history instead of from the moment the process came up.
 - Fresh compactions fold their summary tokens as they happen (`session_compact`).
 - Subagent snapshots are keyed by task id: a re-delivered snapshot replaces the stored one, and a revoked task's tokens are dropped.
+- Every settled subagent is also appended to the orchestrator session file as a custom entry (`dantonio-pi-meter:child-usage/v1`: task id, tokens, wall time). On resume or reload the meter restores those snapshots, so `out`, `in` and the `+N sa` marker keep counting subagents across sessions instead of dropping back to orchestrator-only numbers. A revoked task persists a tombstone that drops it on restore too.
+
+## What the meter does not count
+
+Known blind spots, measured against subagent ground truth on 2026-11-22 (details in the session audit): a child's compaction and branch summaries (never emitted as assistant responses), turns beyond the relay's 128-response buffer, children killed by a session shutdown or settling while another session is active, and telemetry-env vetoes (`DO_NOT_TRACK`, `CI`, `GENTLE_AI_TELEMETRY=0`). What is persisted is exactly what the relay reported at settle time.
 
 ## Render cost
 

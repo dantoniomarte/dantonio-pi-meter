@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { compact, formatRate, renderLine, type Usage } from "../extensions/format.ts";
 import {
+	applyChildSnapshot,
+	CHILD_SNAPSHOT_TYPE,
 	createState,
 	dropChild,
 	endParentResponse,
+	foldChildEntries,
 	foldEntries,
 	noteChild,
 	noteDelta,
@@ -214,4 +217,106 @@ test("foldEntries tolerates malformed entries", () => {
 	assert.equal(foldEntries(state, undefined as unknown as unknown[]), 0);
 	assert.equal(foldEntries(state, [null, 42, "nope"] as unknown as unknown[]), 0);
 	assert.deepEqual(state.parent, zero);
+});
+
+// --- persisted child snapshots -------------------------------------------
+
+const CHILD_ENTRY = CHILD_SNAPSHOT_TYPE;
+
+function childEntry(taskId: string, data: Record<string, unknown>): unknown {
+	return { type: "custom", customType: CHILD_ENTRY, data: { taskId, ...data } };
+}
+
+function childUsageEvent(taskId: string, usage: Partial<Usage>): { taskId: string; responses: unknown[] } {
+	const tokens: Record<string, unknown> = {};
+	for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+		tokens[field] = usage[field] !== undefined ? { state: "reported", value: usage[field] } : { state: "unavailable" };
+	}
+	return { taskId, responses: [{ tokens }] };
+}
+
+test("foldChildEntries restores subagent snapshots from persisted entries", () => {
+	const state = createState();
+	const entries: unknown[] = [
+		childEntry("t1", { input: 500, output: 40, cacheRead: 0, cacheWrite: 8 }),
+		{ type: "custom", customType: "gentle-agents.result", data: {} }, // another extension's entry: ignored
+		childEntry("t2", { output: 20, wallMs: 2_000 }),
+	];
+	assert.equal(foldChildEntries(state, entries), 2);
+	assert.equal(state.subagents, 2);
+	assert.deepEqual(totals(state), { input: 500, output: 60, cacheRead: 0, cacheWrite: 8 });
+	assert.equal(state.subagentMs, 2_000);
+});
+
+test("foldEntries never touches child snapshot entries (no double counting)", () => {
+	const state = createState();
+	const entries: unknown[] = [childEntry("t1", { input: 500, output: 40 })];
+	assert.equal(foldEntries(state, entries), 0);
+	assert.equal(state.subagents, 0);
+	assert.deepEqual(totals(state), zero);
+});
+
+test("foldChildEntries tolerates malformed or empty entries", () => {
+	const state = createState();
+	const entries: unknown[] = [
+		null,
+		42,
+		{ type: "custom", customType: CHILD_ENTRY }, // no data at all
+		childEntry("", { input: 100 }), // empty task id
+		childEntry("t1", { input: 0, output: 0 }), // nothing reported
+		childEntry("t1", { input: Number.NaN, output: -5 }), // not finite / not positive
+		{ type: "message", message: { role: "assistant", usage: { input: 1 } } }, // wrong shape for child fold
+	];
+	assert.equal(foldChildEntries(state, entries), 0);
+	assert.equal(state.subagents, 0);
+	assert.deepEqual(totals(state), zero);
+});
+
+test("a persisted re-delivery replaces the stored snapshot like the bus one", () => {
+	const state = createState();
+	assert.equal(foldChildEntries(state, [childEntry("t1", { input: 500, output: 40 })]), 1);
+	assert.equal(foldChildEntries(state, [childEntry("t1", { input: 900, output: 60, cacheRead: 1_000 })]), 1);
+	assert.equal(state.subagents, 1);
+	assert.deepEqual(totals(state), { input: 900, output: 60, cacheRead: 1_000, cacheWrite: 0 });
+});
+
+test("a persisted tombstone drops the child from the totals", () => {
+	const state = createState();
+	foldChildEntries(state, [
+		childEntry("t1", { input: 500, output: 40 }),
+		childEntry("t2", { output: 20 }),
+	]);
+	assert.equal(foldChildEntries(state, [childEntry("t1", { revoked: true })]), 1);
+	assert.equal(state.subagents, 1);
+	assert.deepEqual(totals(state), { input: 0, output: 20, cacheRead: 0, cacheWrite: 0 });
+	assert.equal(dropChild(state, "t1"), false); // already gone
+});
+
+test("persisted wall time replaces instead of stacking", () => {
+	const state = createState();
+	foldChildEntries(state, [childEntry("t1", { output: 600, wallMs: 5_000 })]);
+	foldChildEntries(state, [childEntry("t1", { output: 900, wallMs: 8_000 })]);
+	assert.equal(state.subagentMs, 8_000);
+	assert.equal(rates(state, 0).subagent, 112.5);
+});
+
+test("parent fold and child fold compose without double counting", () => {
+	const state = createState();
+	const entries: unknown[] = [
+		{ type: "message", message: { role: "assistant", usage: { input: 100, output: 10, cacheRead: 200, cacheWrite: 0 } } },
+		childEntry("t1", { input: 500, output: 40 }),
+	];
+	foldEntries(state, entries);
+	foldChildEntries(state, entries);
+	assert.deepEqual(totals(state), { input: 600, output: 50, cacheRead: 200, cacheWrite: 0 });
+});
+
+test("applyChildSnapshot accepts the exact shape appendEntry persists", () => {
+	const state = createState();
+	assert.equal(applyChildSnapshot(state, { taskId: "t1", input: 500, output: 40, wallMs: 2_000 }), true);
+	assert.deepEqual(totals(state), { input: 500, output: 40, cacheRead: 0, cacheWrite: 0 });
+	assert.equal(state.subagentMs, 2_000);
+	// The bus event path stays compatible: same semantics, derived fields.
+	assert.equal(noteChild(state, childUsageEvent("t2", { input: 100, output: 5 })), true);
+	assert.equal(state.subagents, 2);
 });

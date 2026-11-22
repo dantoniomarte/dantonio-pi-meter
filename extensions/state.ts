@@ -3,8 +3,10 @@
  *
  * Token totals come from provider-reported usage: parent message_end events,
  * the session's own entries (bootstrap on start, so resumed or reloaded
- * sessions start from the full history), and settled gentle-pi subagent
- * events. Speed is measured only on the parent: streamed output characters
+ * sessions start from the full history), settled gentle-pi subagent events,
+ * and the extension's own persisted child snapshots (custom entries appended
+ * at settle time, restored on session start so the child totals survive
+ * resume and reload). Speed is measured only on the parent: streamed output characters
  * are a proxy for live tokens/second, and the session average is total output
  * tokens divided by measured generation time. Subagent events carry tokens
  * and task wall time (launchedAt -> settledAt) but no generation duration, so
@@ -18,8 +20,6 @@
  */
 
 import { addUsage, emptyUsage, sumUsage, type Usage } from "./format.ts";
-
-const TOKEN_FIELDS = ["input", "output", "cacheRead", "cacheWrite", "reasoning", "totalTokens"] as const;
 
 /** Entry shapes foldEntries understands; everything else is ignored. */
 interface LooseEntry {
@@ -46,6 +46,22 @@ export interface MeterState {
 	/** Output tokens of responses whose generation time is in generationMs. */
 	timedOutput: number;
 }
+
+/** Payload appended to the parent session as a custom entry after each settle. */
+export interface ChildSnapshotData {
+	taskId: string;
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	/** Settled wall-time window in ms, when known. */
+	wallMs?: number;
+	/** Tombstone: the task was revoked; drop it instead of folding tokens. */
+	revoked?: boolean;
+}
+
+/** customType of the extension's own persisted child snapshots. */
+export const CHILD_SNAPSHOT_TYPE = "dantonio-pi-meter:child-usage/v1";
 
 export function createState(): MeterState {
 	return {
@@ -130,11 +146,9 @@ export function noteChild(state: MeterState, event: unknown, settledAt?: number,
 	if (!event || typeof event !== "object") return false;
 	const candidate = event as { taskId?: unknown; responses?: unknown };
 	if (typeof candidate.taskId !== "string" || candidate.taskId.length === 0) return false;
-	const taskId = candidate.taskId;
 	const usage: Partial<Usage> = {};
 	let any = false;
-	for (const field of TOKEN_FIELDS) {
-		if (field === "reasoning" || field === "totalTokens") continue;
+	for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
 		const value = reported(candidate.responses, field);
 		if (value > 0) {
 			usage[field] = value;
@@ -142,16 +156,28 @@ export function noteChild(state: MeterState, event: unknown, settledAt?: number,
 		}
 	}
 	if (!any) return false;
+	const wallMs = settledAt !== undefined && launchedAt !== undefined
+		&& Number.isFinite(settledAt) && Number.isFinite(launchedAt)
+		? Math.max(0, Math.round(settledAt - launchedAt))
+		: 0;
+	return setChild(state, candidate.taskId, usage, wallMs);
+}
+
+/**
+ * Store or replace one child task's snapshot. Both the bus event and the
+ * persisted-session fold funnel through here, so a repeated task id replaces
+ * the stored snapshot and its wall-time window (identical re-delivery is a
+ * no-op) no matter which path delivered it. `wallMs <= 0` means unknown: a
+ * degenerate or absent window replaces any stored one. Returns true when
+ * totals changed.
+ */
+function setChild(state: MeterState, taskId: string, usage: Partial<Usage>, wallMs: number): boolean {
 	const snapshot: Usage = {
 		input: usage.input ?? 0,
 		output: usage.output ?? 0,
 		cacheRead: usage.cacheRead ?? 0,
 		cacheWrite: usage.cacheWrite ?? 0,
 	};
-	const wallMs = settledAt !== undefined && launchedAt !== undefined
-		&& Number.isFinite(settledAt) && Number.isFinite(launchedAt)
-		? Math.max(0, Math.round(settledAt - launchedAt))
-		: 0;
 	const previousMs = state.childrenMs.get(taskId);
 	if (wallMs > 0) {
 		state.childrenMs.set(taskId, wallMs);
@@ -164,6 +190,64 @@ export function noteChild(state: MeterState, event: unknown, settledAt?: number,
 	if (!state.children.has(taskId)) state.subagents += 1;
 	state.children.set(taskId, snapshot);
 	return true;
+}
+
+/**
+ * Apply one child snapshot payload — the exact shape appended to the parent
+ * session with `pi.appendEntry(CHILD_SNAPSHOT_TYPE, data)`. A tombstone
+ * (`revoked: true`) drops the task. Returns true when totals changed.
+ */
+export function applyChildSnapshot(state: MeterState, data: unknown): boolean {
+	if (!data || typeof data !== "object") return false;
+	const candidate = data as ChildSnapshotData;
+	if (typeof candidate.taskId !== "string" || candidate.taskId.length === 0) return false;
+	if (candidate.revoked === true) return dropChild(state, candidate.taskId);
+	const usage: Partial<Usage> = {};
+	let any = false;
+	for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+		const value = candidate[field];
+		if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+			usage[field] = value;
+			any = true;
+		}
+	}
+	if (!any) return false;
+	const wallMs = typeof candidate.wallMs === "number" && Number.isFinite(candidate.wallMs)
+		? Math.max(0, Math.round(candidate.wallMs))
+		: 0;
+	return setChild(state, candidate.taskId, usage, wallMs);
+}
+
+function validSnapshotPayload(data: unknown): data is ChildSnapshotData {
+	if (!data || typeof data !== "object") return false;
+	const candidate = data as ChildSnapshotData;
+	if (typeof candidate.taskId !== "string" || candidate.taskId.length === 0) return false;
+	if (candidate.revoked === true) return true;
+	return (["input", "output", "cacheRead", "cacheWrite"] as const).some((field) => {
+		const value = candidate[field];
+		return typeof value === "number" && Number.isFinite(value) && value > 0;
+	});
+}
+
+/**
+ * Restore subagent snapshots from a session's custom entries (the extension's
+ * own CHILD_SNAPSHOT_TYPE ones). Returns the number of valid payloads applied,
+ * including tombstones — a tombstone for an unknown task still counts as
+ * applied. Later entries win, mirroring bus re-delivery.
+ */
+export function foldChildEntries(state: MeterState, entries: readonly unknown[] | undefined): number {
+	if (!Array.isArray(entries)) return 0;
+	let folded = 0;
+	for (const entry of entries) {
+		if (!entry || typeof entry !== "object") continue;
+		const candidate = entry as { type?: string; customType?: string; data?: unknown };
+		if (candidate.type !== "custom" || candidate.customType !== CHILD_SNAPSHOT_TYPE) continue;
+		if (validSnapshotPayload(candidate.data)) {
+			applyChildSnapshot(state, candidate.data);
+			folded += 1;
+		}
+	}
+	return folded;
 }
 
 /** Drop one subagent task's tokens and wall time after a revocation. Returns true if it was stored. */
