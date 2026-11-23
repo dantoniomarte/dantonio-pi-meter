@@ -10,7 +10,7 @@ in 93.6k · out 3.1k · cacheR 80k · cacheW 1.2k · 42 tok/s · avg 31 · +2 sa
 - `cacheR` / `cacheW` are the cached split of `in`: tokens served from cache and tokens written to cache.
 - `out` is provider-reported output. `in` `out` `cacheR` `cacheW` cover the orchestrator plus every settled subagent.
 - `tok/s` is the live decode rate of the current orchestrator response. It is a character-stream estimate (about 4 characters per token), shown only while text is arriving.
-- `avg` is the session average: reported orchestrator output tokens divided by measured orchestrator generation time.
+- `avg` is the session average: reported orchestrator output tokens divided by measured orchestrator generation time. The cumulative timing is appended to the session file after every timed response, so the average also survives resume and reload instead of restarting from zero.
 - `+N sa` counts settled subagents folded into the totals. When subagent task
   throughput is measurable it rides the marker as `+N sa @R`.
 
@@ -28,6 +28,8 @@ in 93.6k · out 3.1k · cacheR 80k · cacheW 1.2k · 42 tok/s · avg 31 · +2 sa
 - Fresh compactions fold their summary tokens as they happen (`session_compact`).
 - Subagent snapshots are keyed by task id: a re-delivered snapshot replaces the stored one, and a revoked task's tokens are dropped.
 - Every settled subagent is also appended to the orchestrator session file as a custom entry (`dantonio-pi-meter:child-usage/v1`: task id, tokens, wall time). On resume or reload the meter restores those snapshots, so `out`, `in` and the `+N sa` marker keep counting subagents across sessions instead of dropping back to orchestrator-only numbers. A revoked task persists a tombstone that drops it on restore too.
+- The cumulative `avg` timing rides the same mechanism as a second custom entry (`dantonio-pi-meter:avg-timing/v1`: cumulative generation ms and output tokens); the last entry wins on fold.
+- Wall-time windows are kept only when plausible (finite, positive, at most one day). Snapshots persisted by versions that mixed `Date.now()` with the relay's `performance.now()` launch time stored windows of ~1.8e12 ms; those windows are dropped on restore while their tokens still count, so `@R` simply stays hidden instead of showing an absurd rate.
 
 ## What the meter does not count
 

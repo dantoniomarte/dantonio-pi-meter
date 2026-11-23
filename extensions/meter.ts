@@ -26,11 +26,14 @@ import {
 	endParentResponse,
 	foldChildEntries,
 	foldEntries,
+	foldTimingEntries,
 	noteChild,
 	noteDelta,
+	persistTiming,
 	rates,
 	totals,
 	type ChildSnapshotData,
+	type GenerationTiming,
 	type MeterState,
 } from "./state.ts";
 
@@ -79,6 +82,8 @@ export default function meterExtension(pi: ExtensionAPI): void {
 	let ctx: ExtensionContext | undefined;
 	let cached = "";
 	let timer: ReturnType<typeof setInterval> | undefined;
+	/** Last cumulative timing appended to the session, to skip no-op entries. */
+	let persistedTiming: GenerationTiming = { generationMs: 0, timedOutput: 0 };
 
 	const appendEntry = typeof pi.appendEntry === "function" ? pi.appendEntry.bind(pi) : undefined;
 
@@ -86,7 +91,7 @@ export default function meterExtension(pi: ExtensionAPI): void {
 		if (!ctx?.hasUI) return;
 		const now = Date.now();
 		const speed = rates(state, now);
-		const line = renderLine({ totals: totals(state), subagents: state.subagents, live: speed.live, average: speed.average });
+		const line = renderLine({ totals: totals(state), subagents: state.subagents, live: speed.live, average: speed.average, subagentRate: speed.subagent });
 		if (!force && line === cached) return;
 		cached = line;
 		try {
@@ -127,11 +132,14 @@ export default function meterExtension(pi: ExtensionAPI): void {
 			const entries = ctx.sessionManager.getEntries();
 			foldEntries(state, entries);
 			// Restores the child snapshots persisted at settle time, so the
-			// subagent totals survive resume and reload.
+			// subagent totals survive resume and reload, plus the cumulative
+			// avg timing so the session average also survives.
 			foldChildEntries(state, entries);
+			foldTimingEntries(state, entries);
 		} catch {
 			// Bootstrap is best-effort; live events still accrue.
 		}
+		persistedTiming = { generationMs: state.generationMs, timedOutput: state.timedOutput };
 		// Usage sources re-register per session (the shell's no-op-replace
 		// pattern) and stay inert unless the session targets their provider.
 		// Settings under the dantonio-pi-meter key add custom bearer sources
@@ -163,6 +171,10 @@ export default function meterExtension(pi: ExtensionAPI): void {
 		if (update.message?.role === "assistant") {
 			stopTick();
 			endParentResponse(state, update.message.usage, Date.now());
+			// Cumulative snapshot per timed response: the last entry wins on fold.
+			if (appendEntry && persistTiming(state, appendEntry)) {
+				persistedTiming = { generationMs: state.generationMs, timedOutput: state.timedOutput };
+			}
 			paint(true);
 			return;
 		}
@@ -185,9 +197,11 @@ export default function meterExtension(pi: ExtensionAPI): void {
 
 	pi.events?.on?.(CHILD_METRICS_EVENT, (value: unknown) => {
 		const event = value as ChildMetricsEvent | null;
-		// Task throughput uses the settle moment as the right edge of the
-		// launch->settle wall-time window.
-		if (!noteChild(state, value, Date.now(), event?.launchedAt)) return;
+		// gentle-pi emits launchedAt on its performance.now() monotonic clock
+		// (uptime ms, not epoch), so the settle edge must use the same clock;
+		// mixing in Date.now() once produced ~1.795e12 ms wall windows.
+		const settleAt = performance.now();
+		if (!noteChild(state, value, settleAt, event?.launchedAt)) return;
 		if (appendEntry && event) persistChild(state, event.taskId, appendEntry);
 		paint(true);
 	});

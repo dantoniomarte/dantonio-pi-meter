@@ -3,12 +3,14 @@ import test from "node:test";
 import { compact, formatRate, renderLine, type Usage } from "../extensions/format.ts";
 import {
 	applyChildSnapshot,
+	AVG_TIMING_TYPE,
 	CHILD_SNAPSHOT_TYPE,
 	createState,
 	dropChild,
 	endParentResponse,
 	foldChildEntries,
 	foldEntries,
+	foldTimingEntries,
 	noteChild,
 	noteDelta,
 	rates,
@@ -319,4 +321,82 @@ test("applyChildSnapshot accepts the exact shape appendEntry persists", () => {
 	// The bus event path stays compatible: same semantics, derived fields.
 	assert.equal(noteChild(state, childUsageEvent("t2", { input: 100, output: 5 })), true);
 	assert.equal(state.subagents, 2);
+});
+
+// --- wall-time plausibility (clock-mix garbage) ---------------------------
+
+test("implausible persisted wall time is dropped, tokens still count", () => {
+	const state = createState();
+	// Observed garbage from mixing Date.now() settle with a performance.now()
+	// launch: epoch minus uptime ≈ 1.795e12 ms ("57 years" per task).
+	assert.equal(applyChildSnapshot(state, { taskId: "t1", output: 600, wallMs: 1_795_437_201_732 }), true);
+	assert.equal(state.subagents, 1);
+	assert.deepEqual(totals(state), { input: 0, output: 600, cacheRead: 0, cacheWrite: 0 });
+	assert.equal(state.subagentMs, 0);
+	assert.equal(rates(state, 0).subagent, undefined);
+});
+
+test("wall time up to one day stays plausible, beyond it is dropped", () => {
+	const state = createState();
+	assert.equal(applyChildSnapshot(state, { taskId: "t1", output: 600, wallMs: 86_400_000 }), true);
+	assert.equal(state.subagentMs, 86_400_000);
+	assert.equal(applyChildSnapshot(state, { taskId: "t2", output: 600, wallMs: 86_400_001 }), true);
+	assert.equal(state.childrenMs.has("t2"), false);
+	assert.equal(state.subagentMs, 86_400_000);
+});
+
+// --- average timing persistence -------------------------------------------
+
+function timingEntry(generationMs: number, timedOutput: number): unknown {
+	return { type: "custom", customType: AVG_TIMING_TYPE, data: { generationMs, timedOutput } };
+}
+
+test("average timing restores across resume from cumulative entries", () => {
+	const state = createState();
+	noteDelta(state, 400, 1_000);
+	endParentResponse(state, { output: 100 }, 3_000); // 2,000 ms / 100 tokens
+
+	// A resumed session folds the token totals and the cumulative timing.
+	const resumed = createState();
+	foldEntries(resumed, [{ type: "message", message: { role: "assistant", usage: { output: 100 } } }]);
+	assert.equal(foldTimingEntries(resumed, [timingEntry(2_000, 100)]), 1);
+	assert.equal(rates(resumed, 0).average, 50);
+});
+
+test("the last timing entry wins and re-folding replaces instead of stacking", () => {
+	const state = createState();
+	const entries = [timingEntry(2_000, 100), timingEntry(4_000, 220)];
+	assert.equal(foldTimingEntries(state, entries), 2);
+	assert.equal(state.generationMs, 4_000);
+	assert.equal(state.timedOutput, 220);
+	// A re-fired session_start folds the same entries again: replace, not add.
+	foldTimingEntries(state, entries);
+	assert.equal(state.generationMs, 4_000);
+	assert.equal(state.timedOutput, 220);
+});
+
+test("responses after resume extend the restored average", () => {
+	const state = createState();
+	foldTimingEntries(state, [timingEntry(2_000, 100)]);
+	noteDelta(state, 200, 10_000);
+	endParentResponse(state, { output: 50 }, 11_000); // 1,000 ms / 50 tokens
+	assert.equal(state.generationMs, 3_000);
+	assert.equal(rates(state, 0).average, 50);
+});
+
+test("malformed timing entries are ignored", () => {
+	const state = createState();
+	assert.equal(
+		foldTimingEntries(state, [
+			null,
+			42,
+			{ type: "custom", customType: AVG_TIMING_TYPE }, // no data at all
+			{ type: "custom", customType: AVG_TIMING_TYPE, data: { generationMs: Number.NaN, timedOutput: 1 } },
+			{ type: "custom", customType: AVG_TIMING_TYPE, data: { generationMs: -5, timedOutput: 1 } },
+			{ type: "custom", customType: "gentle-agents.result", data: { generationMs: 9, timedOutput: 9 } }, // foreign
+		]),
+		0,
+	);
+	assert.equal(state.generationMs, 0);
+	assert.equal(state.timedOutput, 0);
 });

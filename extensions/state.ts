@@ -28,6 +28,30 @@ interface LooseEntry {
 	usage?: Partial<Usage>;
 }
 
+/** customType of the cumulative avg-timing entries appended to the session. */
+export const AVG_TIMING_TYPE = "dantonio-pi-meter:avg-timing/v1";
+
+/** Cumulative parent timing the session average needs to survive resume. */
+export interface GenerationTiming {
+	/** Accumulated parent generation time, ms. Excludes the live response. */
+	generationMs: number;
+	/** Output tokens of responses whose generation time is in generationMs. */
+	timedOutput: number;
+}
+
+/** Anything longer than a day of wall time is clock-mix garbage, not a task. */
+const MAX_PLAUSIBLE_WALL_MS = 86_400_000;
+
+/**
+ * Wall time is only kept when it is a finite, positive, sub-day duration.
+ * Older persisted snapshots mixed an epoch-ms settle with a performance.now()
+ * launch and stored ~1.795e12 ms per task; those windows are dropped while
+ * their tokens still count.
+ */
+function sanitizeWall(wallMs: number): number {
+	return Number.isFinite(wallMs) && wallMs > 0 && wallMs <= MAX_PLAUSIBLE_WALL_MS ? Math.round(wallMs) : 0;
+}
+
 export interface MeterState {
 	parent: Usage;
 	/** One snapshot per settled subagent task, keyed by task id. */
@@ -41,9 +65,8 @@ export interface MeterState {
 	liveChars: number;
 	/** When the current parent response started emitting, ms. */
 	liveStartedAt?: number;
-	/** Accumulated parent generation time, ms. Excludes the live response. */
+	/** Cumulative parent timing the session average is built on. */
 	generationMs: number;
-	/** Output tokens of responses whose generation time is in generationMs. */
 	timedOutput: number;
 }
 
@@ -171,7 +194,8 @@ export function noteChild(state: MeterState, event: unknown, settledAt?: number,
  * degenerate or absent window replaces any stored one. Returns true when
  * totals changed.
  */
-function setChild(state: MeterState, taskId: string, usage: Partial<Usage>, wallMs: number): boolean {
+function setChild(state: MeterState, taskId: string, usage: Partial<Usage>, rawWallMs: number): boolean {
+	const wallMs = sanitizeWall(rawWallMs);
 	const snapshot: Usage = {
 		input: usage.input ?? 0,
 		output: usage.output ?? 0,
@@ -260,6 +284,50 @@ export function dropChild(state: MeterState, taskId: string): boolean {
 	if (!state.children.delete(taskId)) return false;
 	state.subagents -= 1;
 	return true;
+}
+
+/**
+ * Persist the cumulative parent timing so a resumed session rebuilds the same
+ * session average instead of restarting it from zero. Callers append this
+ * after every timed parent response; the payload replaces on fold.
+ * Returns true when an entry was appended.
+ */
+export function persistTiming(state: MeterState, appendEntry: (customType: string, data?: unknown) => void): boolean {
+	if (state.generationMs <= 0 || state.timedOutput <= 0) return false;
+	try {
+		appendEntry(AVG_TIMING_TYPE, { generationMs: state.generationMs, timedOutput: state.timedOutput });
+	} catch {
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Restore the cumulative avg timing from a session's AVG_TIMING_TYPE custom
+ * entries. Entries are cumulative snapshots: the last valid one wins, so a
+ * re-fired session_start folds the same entries again without stacking.
+ * Returns the number of valid payloads applied.
+ */
+export function foldTimingEntries(state: MeterState, entries: readonly unknown[] | undefined): number {
+	if (!Array.isArray(entries)) return 0;
+	let folded = 0;
+	for (const entry of entries) {
+		if (!entry || typeof entry !== "object") continue;
+		const candidate = entry as { type?: string; customType?: string; data?: unknown };
+		if (candidate.type !== "custom" || candidate.customType !== AVG_TIMING_TYPE) continue;
+		const data = candidate.data as Partial<GenerationTiming> | undefined;
+		const generationMs = typeof data?.generationMs === "number" && Number.isFinite(data.generationMs) && data.generationMs >= 0
+			? data.generationMs
+			: undefined;
+		const timedOutput = typeof data?.timedOutput === "number" && Number.isFinite(data.timedOutput) && data.timedOutput >= 0
+			? data.timedOutput
+			: undefined;
+		if (generationMs === undefined || timedOutput === undefined) continue;
+		state.generationMs = generationMs;
+		state.timedOutput = timedOutput;
+		folded += 1;
+	}
+	return folded;
 }
 
 export interface Rates {
