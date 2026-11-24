@@ -17,6 +17,7 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { addUsage, renderLine } from "./format.ts";
+import { readChildTimingRetried, resolveAgentHome } from "./child-sessions.ts";
 import { registerUsageSources } from "./usage-registry.ts";
 import { customUsageProviders, registerCustomUsageSources } from "./usage-custom.ts";
 import {
@@ -35,10 +36,26 @@ import {
 	type ChildSnapshotData,
 	type GenerationTiming,
 	type MeterState,
+	setChildTiming,
 } from "./state.ts";
 
 const WIDGET_KEY = "dantonio-pi-meter";
 const TICK_MS = 250;
+
+/**
+ * Children restored from older snapshots may carry no decode timing; read it
+ * from their session JSONL once at session start, never blocking the line.
+ */
+async function backfillChildTiming(state: MeterState, agentHome: string): Promise<boolean> {
+	let changed = false;
+	for (const taskId of [...state.children.keys()]) {
+		if (state.childrenTiming.has(taskId)) continue;
+		const timing = await readChildTimingRetried(agentHome, taskId);
+		// The task can be revoked while we read; re-check before folding.
+		if (timing && setChildTiming(state, taskId, timing)) changed = true;
+	}
+	return changed;
+}
 
 interface AssistantEvent {
 	message: { role?: string; usage?: Partial<MeterState["parent"]> };
@@ -70,6 +87,11 @@ function persistChild(state: MeterState, taskId: string, appendEntry: (customTyp
 	};
 	const wallMs = state.childrenMs.get(taskId);
 	if (wallMs !== undefined) data.wallMs = wallMs;
+	const timing = state.childrenTiming.get(taskId);
+	if (timing) {
+		data.timingMs = timing.generationMs;
+		data.timedOutput = timing.timedOutput;
+	}
 	try {
 		appendEntry(CHILD_SNAPSHOT_TYPE, data);
 	} catch {
@@ -84,6 +106,8 @@ export default function meterExtension(pi: ExtensionAPI): void {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	/** Last cumulative timing appended to the session, to skip no-op entries. */
 	let persistedTiming: GenerationTiming = { generationMs: 0, timedOutput: 0 };
+	/** Child session home, resolved once per session (mirrors gentle-pi). */
+	let agentHome: string | undefined;
 
 	const appendEntry = typeof pi.appendEntry === "function" ? pi.appendEntry.bind(pi) : undefined;
 
@@ -140,6 +164,16 @@ export default function meterExtension(pi: ExtensionAPI): void {
 			// Bootstrap is best-effort; live events still accrue.
 		}
 		persistedTiming = { generationMs: state.generationMs, timedOutput: state.timedOutput };
+		agentHome = resolveAgentHome();
+		// Snapshots restored from older sessions (or persisted untimed) get their
+		// decode timing from disk, fire-and-forget: the line paints when it lands.
+		void backfillChildTiming(state, agentHome)
+			.then((changed) => {
+				if (changed) paint(true);
+			})
+			.catch(() => {
+				// A failed read leaves the child untimed; nothing to report.
+			});
 		// Usage sources re-register per session (the shell's no-op-replace
 		// pattern) and stay inert unless the session targets their provider.
 		// Settings under the dantonio-pi-meter key add custom bearer sources
@@ -195,13 +229,17 @@ export default function meterExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.events?.on?.(CHILD_METRICS_EVENT, (value: unknown) => {
+	pi.events?.on?.(CHILD_METRICS_EVENT, async (value: unknown) => {
 		const event = value as ChildMetricsEvent | null;
 		// gentle-pi emits launchedAt on its performance.now() monotonic clock
 		// (uptime ms, not epoch), so the settle edge must use the same clock;
 		// mixing in Date.now() once produced ~1.795e12 ms wall windows.
 		const settleAt = performance.now();
-		if (!noteChild(state, value, settleAt, event?.launchedAt)) return;
+		// Decode timing comes from the child's session JSONL on disk; the host
+		// writes the task record right after this event, so the join retries a
+		// bounded number of times before degrading to an untimed child.
+		const timing = event && agentHome !== undefined ? await readChildTimingRetried(agentHome, event.taskId) : undefined;
+		if (!noteChild(state, value, settleAt, event?.launchedAt, timing)) return;
 		if (appendEntry && event) persistChild(state, event.taskId, appendEntry);
 		paint(true);
 	});
