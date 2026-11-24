@@ -20,13 +20,14 @@ T1 (S1, S3, S4): child timing collection — parse child session JSONL (`parseTi
 
 T2 (S2, S3, S4): live child rate — notification subscription, per-running-child JSONL tail (offset-tracked incremental read), aggregate live rate into render (`sa <rate> tok/s`), cleanup on settle/revoke/shutdown. Commit: (this slice).
 
-T3 (S1-S4): README update (avg semantics, sa live segment, blind spots: relay final-only `out` vs decode base, message-completion cadence, legacy untimed children). Commit with T2.
+T3 (S1-S4): README update (avg semantics, sa live segment, blind spots: relay final-only `out` vs decode base, message-completion cadence, legacy untimed children). Commit: (this slice, with package version 0.4.2 -> 0.5.0).
 
 ### Log (work notes)
 
 - T1 slice was 495 authored lines — past the ~400-line boundary, recorded here per delivery policy.
 - T1 review note: commit message documented a bounded settle-race retry that the code did not implement (`readChildTimingRetried` missing from child-sessions.ts; tests never import meter.ts). Fixed at the start of T2 along with the T2 wiring; keep meter.ts wiring covered by a smoke import check in future slices.
 - T2: truncation detection needs mtime comparison, not just size < offset (truncate-and-rewrite at equal size would be missed).
+- Verification boundary: disk-reading paths are unit-tested against the real on-disk shapes (task record and child JSONL verified 2026-11-24); the meter.ts live wiring (notification subscription, tail drive at render cadence) passed syntax and full-suite checks only — end-to-end confirmation needs a real session running subagents after /reload.
 
 ## Log
 
