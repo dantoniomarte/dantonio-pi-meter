@@ -89,3 +89,44 @@ export async function readChildTiming(agentHome: string, taskId: string): Promis
 	const timing = parseTimedMessages(text);
 	return timing.generationMs > 0 && timing.timedOutput > 0 ? timing : undefined;
 }
+
+/** Bounded settle-race retry: the host writes the task record right after the metrics event. */
+const TIMING_READ_ATTEMPTS = 10;
+const TIMING_RETRY_MS = 150;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * `readChildTiming` with a bounded retry: at settle time the task record (and
+ * its `sessionPath`) may land on disk a beat after the metrics event, so a
+ * single read would spuriously drop timing for fast children. Missing timing
+ * after all attempts degrades to an untimed child — never a guess.
+ */
+export async function readChildTimingRetried(agentHome: string, taskId: string): Promise<ChildTiming | undefined> {
+	for (let attempt = 0; attempt < TIMING_READ_ATTEMPTS; attempt += 1) {
+		const timing = await readChildTiming(agentHome, taskId);
+		if (timing) return timing;
+		if (attempt + 1 < TIMING_READ_ATTEMPTS) await sleep(TIMING_RETRY_MS);
+	}
+	return undefined;
+}
+
+/**
+ * Resolve one child's session path from its task record. The launch record is
+ * written to disk immediately at launch (#1741), but `sessionPath` may only
+ * be resolved on a later write, so callers retry while the child runs.
+ * Returns undefined on a missing/unreadable record, null when the record
+ * exists but names no session yet, and the path otherwise.
+ */
+export async function readChildSessionPath(agentHome: string, taskId: string): Promise<string | null | undefined> {
+	if (!SAFE_ID.test(taskId)) return undefined;
+	try {
+		const record = JSON.parse(await readFile(join(agentHome, "gentle-agents", "tasks", `${taskId}.json`), "utf8")) as {
+			task?: { sessionPath?: unknown };
+		};
+		const path = record?.task?.sessionPath;
+		return typeof path === "string" && path.length > 0 ? path : null;
+	} catch {
+		return undefined;
+	}
+}

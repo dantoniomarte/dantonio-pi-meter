@@ -16,11 +16,17 @@ S4: Honest degradation, measured not invented: a child without a readable sessio
 
 ## Tasks
 
-T1 (S1, S3, S4): child timing collection — parse child session JSONL (`parseTimedMessages`), per-child timing fold/replace/drop in state, persisted inside the child snapshot entry (`timingMs`/`timedOutput`), combined `avg` in `rates()`; RED tests first. Commit.
+T1 (S1, S3, S4): child timing collection — parse child session JSONL (`parseTimedMessages`), per-child timing fold/replace/drop in state, persisted inside the child snapshot entry (`timingMs`/`timedOutput`), combined `avg` in `rates()`; RED tests first. Commit: de1c34c.
 
-T2 (S2, S3, S4): live child rate — notification subscription, per-running-child JSONL tail (offset-tracked incremental read), aggregate live rate into render (`sa <rate> tok/s`), cleanup on settle/revoke/shutdown. Commit.
+T2 (S2, S3, S4): live child rate — notification subscription, per-running-child JSONL tail (offset-tracked incremental read), aggregate live rate into render (`sa <rate> tok/s`), cleanup on settle/revoke/shutdown. Commit: (this slice).
 
 T3 (S1-S4): README update (avg semantics, sa live segment, blind spots: relay final-only `out` vs decode base, message-completion cadence, legacy untimed children). Commit with T2.
+
+### Log (work notes)
+
+- T1 slice was 495 authored lines — past the ~400-line boundary, recorded here per delivery policy.
+- T1 review note: commit message documented a bounded settle-race retry that the code did not implement (`readChildTimingRetried` missing from child-sessions.ts; tests never import meter.ts). Fixed at the start of T2 along with the T2 wiring; keep meter.ts wiring covered by a smoke import check in future slices.
+- T2: truncation detection needs mtime comparison, not just size < offset (truncate-and-rewrite at equal size would be missed).
 
 ## Log
 

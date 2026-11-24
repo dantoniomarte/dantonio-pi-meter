@@ -52,10 +52,12 @@ export interface MeterView {
 	subagents: number;
 	/** Live decode rate of the current parent response, if streaming. */
 	live?: number;
-	/** Session average: total output tokens / measured generation seconds. */
+	/** Session average: output tokens / measured generation seconds, all timed agents. */
 	average?: number;
 	/** Aggregate subagent task throughput: output tokens / settled wall seconds. */
 	subagentRate?: number;
+	/** Aggregate live decode rate of running children, when measurable. */
+	childLive?: number;
 }
 
 /**
@@ -83,5 +85,6 @@ export function renderLine(view: MeterView): string {
 		const rate = view.subagentRate !== undefined ? ` @${formatRate(view.subagentRate)}` : "";
 		parts.push(`+${view.subagents} sa${rate}`);
 	}
+	if (view.childLive !== undefined) parts.push(`sa ${formatRate(view.childLive)} tok/s`);
 	return parts.join(" · ");
 }
