@@ -1,6 +1,6 @@
 {
   "name": "dantonio-pi-meter",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "One subtle line above the Pi editor: session token totals (orchestrator + settled subagents), live/session tokens per second including subagents, and subscription usage sources for the alt+u panel (torogoz, OpenCode Go, OpenRouter, custom).",
   "type": "module",
   "license": "MIT",
