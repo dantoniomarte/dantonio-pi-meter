@@ -17,6 +17,8 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { addUsage, renderLine } from "./format.ts";
+import { readChildSessionPath, readChildTimingRetried, resolveAgentHome } from "./child-sessions.ts";
+import { LiveChildTails } from "./child-live.ts";
 import { registerUsageSources } from "./usage-registry.ts";
 import { customUsageProviders, registerCustomUsageSources } from "./usage-custom.ts";
 import {
@@ -35,10 +37,26 @@ import {
 	type ChildSnapshotData,
 	type GenerationTiming,
 	type MeterState,
+	setChildTiming,
 } from "./state.ts";
 
 const WIDGET_KEY = "dantonio-pi-meter";
 const TICK_MS = 250;
+
+/**
+ * Children restored from older snapshots may carry no decode timing; read it
+ * from their session JSONL once at session start, never blocking the line.
+ */
+async function backfillChildTiming(state: MeterState, agentHome: string): Promise<boolean> {
+	let changed = false;
+	for (const taskId of [...state.children.keys()]) {
+		if (state.childrenTiming.has(taskId)) continue;
+		const timing = await readChildTimingRetried(agentHome, taskId);
+		// The task can be revoked while we read; re-check before folding.
+		if (timing && setChildTiming(state, taskId, timing)) changed = true;
+	}
+	return changed;
+}
 
 interface AssistantEvent {
 	message: { role?: string; usage?: Partial<MeterState["parent"]> };
@@ -58,6 +76,15 @@ interface ChildMetricsEvent {
 const CHILD_METRICS_EVENT = "gentle:runtime-metrics:child/v1";
 const CHILD_METRICS_REVOKED = "gentle:runtime-metrics:revoked/v1";
 
+/** gentle-pi's task-status notification: the only launch/run signal on the bus. */
+interface ChildStatusEvent {
+	taskId?: string;
+	status?: string;
+	event?: string;
+}
+const CHILD_STATUS_EVENT = "gentle-pi:notification:source";
+const CHILD_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "timed_out"]);
+
 function persistChild(state: MeterState, taskId: string, appendEntry: (customType: string, data?: unknown) => void): void {
 	const snapshot = state.children.get(taskId);
 	if (!snapshot) return;
@@ -70,6 +97,11 @@ function persistChild(state: MeterState, taskId: string, appendEntry: (customTyp
 	};
 	const wallMs = state.childrenMs.get(taskId);
 	if (wallMs !== undefined) data.wallMs = wallMs;
+	const timing = state.childrenTiming.get(taskId);
+	if (timing) {
+		data.timingMs = timing.generationMs;
+		data.timedOutput = timing.timedOutput;
+	}
 	try {
 		appendEntry(CHILD_SNAPSHOT_TYPE, data);
 	} catch {
@@ -84,6 +116,10 @@ export default function meterExtension(pi: ExtensionAPI): void {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	/** Last cumulative timing appended to the session, to skip no-op entries. */
 	let persistedTiming: GenerationTiming = { generationMs: 0, timedOutput: 0 };
+	/** Child session home, resolved once per session (mirrors gentle-pi). */
+	let agentHome: string | undefined;
+	/** Live decode tails for running children; driven by the render cadence. */
+	const tails = new LiveChildTails();
 
 	const appendEntry = typeof pi.appendEntry === "function" ? pi.appendEntry.bind(pi) : undefined;
 
@@ -91,7 +127,7 @@ export default function meterExtension(pi: ExtensionAPI): void {
 		if (!ctx?.hasUI) return;
 		const now = Date.now();
 		const speed = rates(state, now);
-		const line = renderLine({ totals: totals(state), subagents: state.subagents, live: speed.live, average: speed.average, subagentRate: speed.subagent });
+		const line = renderLine({ totals: totals(state), subagents: state.subagents, live: speed.live, average: speed.average, subagentRate: speed.subagent, childLive: tails.rate() });
 		if (!force && line === cached) return;
 		cached = line;
 		try {
@@ -108,13 +144,25 @@ export default function meterExtension(pi: ExtensionAPI): void {
 
 	function ensureTick(): void {
 		if (timer || !ctx?.hasUI) return;
+		if (state.liveStartedAt === undefined && tails.size === 0) return;
 		timer = setInterval(() => {
-			if (state.liveStartedAt === undefined) {
+			const parentStreaming = state.liveStartedAt !== undefined;
+			const childStreaming = tails.size > 0;
+			if (!parentStreaming && !childStreaming) {
 				clearInterval(timer);
 				timer = undefined;
 				return;
 			}
-			paint();
+			// Child tails read at render cadence: new timed messages repaint the
+			// line once, never per character.
+			if (childStreaming) {
+				void tails.tick().then((changed) => {
+					if (changed) paint();
+				}).catch(() => {
+					// A failed read leaves the previous rate in place.
+				});
+			}
+			if (parentStreaming) paint();
 		}, TICK_MS);
 	}
 
@@ -140,6 +188,16 @@ export default function meterExtension(pi: ExtensionAPI): void {
 			// Bootstrap is best-effort; live events still accrue.
 		}
 		persistedTiming = { generationMs: state.generationMs, timedOutput: state.timedOutput };
+		agentHome = resolveAgentHome();
+		// Snapshots restored from older sessions (or persisted untimed) get their
+		// decode timing from disk, fire-and-forget: the line paints when it lands.
+		void backfillChildTiming(state, agentHome)
+			.then((changed) => {
+				if (changed) paint(true);
+			})
+			.catch(() => {
+				// A failed read leaves the child untimed; nothing to report.
+			});
 		// Usage sources re-register per session (the shell's no-op-replace
 		// pattern) and stay inert unless the session targets their provider.
 		// Settings under the dantonio-pi-meter key add custom bearer sources
@@ -195,18 +253,45 @@ export default function meterExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.events?.on?.(CHILD_METRICS_EVENT, (value: unknown) => {
+	pi.events?.on?.(CHILD_STATUS_EVENT, (value: unknown) => {
+		const event = value as ChildStatusEvent | null;
+		if (!event || typeof event.taskId !== "string" || event.taskId.length === 0) return;
+		if (agentHome === undefined) return;
+		if (typeof event.status === "string" && CHILD_TERMINAL_STATUSES.has(event.status)) {
+			// Settled children stop contributing a live rate; their decode timing
+			// folds into avg through the metrics path below.
+			if (tails.untrack(event.taskId)) paint(true);
+			return;
+		}
+		if (tails.track(event.taskId, () => readChildSessionPath(agentHome!, event.taskId!))) {
+			paint(true);
+			ensureTick();
+		}
+	});
+
+	pi.events?.on?.(CHILD_METRICS_EVENT, async (value: unknown) => {
 		const event = value as ChildMetricsEvent | null;
 		// gentle-pi emits launchedAt on its performance.now() monotonic clock
 		// (uptime ms, not epoch), so the settle edge must use the same clock;
 		// mixing in Date.now() once produced ~1.795e12 ms wall windows.
 		const settleAt = performance.now();
-		if (!noteChild(state, value, settleAt, event?.launchedAt)) return;
+		// Decode timing comes from the child's session JSONL on disk; the host
+		// writes the task record right after this event, so the join retries a
+		// bounded number of times before degrading to an untimed child.
+		const timing = event && agentHome !== undefined ? await readChildTimingRetried(agentHome, event.taskId) : undefined;
+		// The task settled: its live tail ends here even if the status
+		// notification raced ahead of or behind this event.
+		const wasLive = tails.untrack(event?.taskId ?? "");
+		if (!noteChild(state, value, settleAt, event?.launchedAt, timing)) {
+			if (wasLive) paint(true);
+			return;
+		}
 		if (appendEntry && event) persistChild(state, event.taskId, appendEntry);
 		paint(true);
 	});
 
 	pi.events?.on?.(CHILD_METRICS_REVOKED, (taskId: unknown) => {
+		tails.untrack(typeof taskId === "string" ? taskId : "");
 		if (typeof taskId !== "string" || !dropChild(state, taskId)) return;
 		try {
 			appendEntry?.(CHILD_SNAPSHOT_TYPE, { taskId, revoked: true });
@@ -218,6 +303,7 @@ export default function meterExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async () => {
 		stopTick();
+		tails.clear();
 		ctx = undefined;
 	});
 }

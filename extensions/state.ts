@@ -6,12 +6,15 @@
  * sessions start from the full history), settled gentle-pi subagent events,
  * and the extension's own persisted child snapshots (custom entries appended
  * at settle time, restored on session start so the child totals survive
- * resume and reload). Speed is measured only on the parent: streamed output characters
- * are a proxy for live tokens/second, and the session average is total output
- * tokens divided by measured generation time. Subagent events carry tokens
- * and task wall time (launchedAt -> settledAt) but no generation duration, so
- * the +N sa @R segment shows task throughput (tool time included) and the
- * parent-only decode metrics stay honest.
+ * resume and reload). The live rate is measured only on the parent: streamed
+ * output characters are a proxy for live tokens/second. The session average
+ * covers every timed agent: the parent's measured generation time plus each
+ * settled child's decode timing, read from its session JSONL on disk (per
+ * assistant message `durationMs`, joined through the task record's
+ * `sessionPath`); children without readable timing contribute tokens but not
+ * time. Subagent events also carry task wall time (launchedAt -> settledAt),
+ * which feeds the +N sa @R task-throughput segment (tool time included), a
+ * different unit from any decode rate.
  *
  * Field semantics follow pi's canonical usage split (see /session-info):
  * `input` is the uncached portion, `cacheRead` the tokens served from cache,
@@ -39,6 +42,14 @@ export interface GenerationTiming {
 	timedOutput: number;
 }
 
+/** One settled child's decode timing, read from its session JSONL on disk. */
+export interface ChildTiming {
+	/** Summed assistant-message generation duration, ms. */
+	generationMs: number;
+	/** Output tokens of the messages whose duration is in generationMs. */
+	timedOutput: number;
+}
+
 /** Anything longer than a day of wall time is clock-mix garbage, not a task. */
 const MAX_PLAUSIBLE_WALL_MS = 86_400_000;
 
@@ -60,6 +71,12 @@ export interface MeterState {
 	childrenMs: Map<string, number>;
 	/** Sum of settled subagent wall time, ms. Tracks childrenMs. */
 	subagentMs: number;
+	/** One settled decode-timing snapshot per subagent task, keyed by task id. */
+	childrenTiming: Map<string, ChildTiming>;
+	/** Sum of settled child generation time, ms. Tracks childrenTiming. */
+	childTimingMs: number;
+	/** Output tokens counted with childTimingMs. Tracks childrenTiming. */
+	childTimedOutput: number;
 	subagents: number;
 	/** Output characters seen in the current parent response. */
 	liveChars: number;
@@ -79,6 +96,10 @@ export interface ChildSnapshotData {
 	cacheWrite?: number;
 	/** Settled wall-time window in ms, when known. */
 	wallMs?: number;
+	/** Child decode timing folded into the combined average, when known. */
+	timingMs?: number;
+	/** Output tokens counted with timingMs. */
+	timedOutput?: number;
 	/** Tombstone: the task was revoked; drop it instead of folding tokens. */
 	revoked?: boolean;
 }
@@ -91,6 +112,9 @@ export function createState(): MeterState {
 		parent: emptyUsage(),
 		children: new Map(),
 		childrenMs: new Map(),
+		childrenTiming: new Map(),
+		childTimingMs: 0,
+		childTimedOutput: 0,
 		subagentMs: 0,
 		subagents: 0,
 		liveChars: 0,
@@ -165,7 +189,7 @@ function sameUsage(a: Usage | undefined, b: Usage): boolean {
  * settledAt - launchedAt, both provided by the caller in ms; a degenerate or
  * absent window replaces any stored one. Returns true when totals changed.
  */
-export function noteChild(state: MeterState, event: unknown, settledAt?: number, launchedAt?: number): boolean {
+export function noteChild(state: MeterState, event: unknown, settledAt?: number, launchedAt?: number, timing?: ChildTiming): boolean {
 	if (!event || typeof event !== "object") return false;
 	const candidate = event as { taskId?: unknown; responses?: unknown };
 	if (typeof candidate.taskId !== "string" || candidate.taskId.length === 0) return false;
@@ -183,7 +207,7 @@ export function noteChild(state: MeterState, event: unknown, settledAt?: number,
 		&& Number.isFinite(settledAt) && Number.isFinite(launchedAt)
 		? Math.max(0, Math.round(settledAt - launchedAt))
 		: 0;
-	return setChild(state, candidate.taskId, usage, wallMs);
+	return setChild(state, candidate.taskId, usage, wallMs, timing);
 }
 
 /**
@@ -191,10 +215,12 @@ export function noteChild(state: MeterState, event: unknown, settledAt?: number,
  * persisted-session fold funnel through here, so a repeated task id replaces
  * the stored snapshot and its wall-time window (identical re-delivery is a
  * no-op) no matter which path delivered it. `wallMs <= 0` means unknown: a
- * degenerate or absent window replaces any stored one. Returns true when
- * totals changed.
+ * degenerate or absent window replaces any stored one. Same for the decode
+ * timing: absent or degenerate timing replaces any stored one, so an untimed
+ * re-delivery never stacks with an older timing. Returns true when totals
+ * changed.
  */
-function setChild(state: MeterState, taskId: string, usage: Partial<Usage>, rawWallMs: number): boolean {
+function setChild(state: MeterState, taskId: string, usage: Partial<Usage>, rawWallMs: number, timing?: ChildTiming): boolean {
 	const wallMs = sanitizeWall(rawWallMs);
 	const snapshot: Usage = {
 		input: usage.input ?? 0,
@@ -210,10 +236,44 @@ function setChild(state: MeterState, taskId: string, usage: Partial<Usage>, rawW
 		state.childrenMs.delete(taskId);
 		state.subagentMs -= previousMs;
 	}
+	applyChildTiming(state, taskId, timing);
 	if (sameUsage(state.children.get(taskId), snapshot)) return false;
 	if (!state.children.has(taskId)) state.subagents += 1;
 	state.children.set(taskId, snapshot);
 	return true;
+}
+
+/**
+ * Store, replace, or clear one child's decode timing with the same replace
+ * semantics as its wall-time window: a degenerate or absent timing (unreadable
+ * session file, for example) drops any stored one instead of stacking zeros.
+ * Returns true when the timing aggregate changed.
+ */
+function applyChildTiming(state: MeterState, taskId: string, timing?: ChildTiming): boolean {
+	const valid = timing !== undefined && timing.generationMs > 0 && timing.timedOutput > 0 ? timing : undefined;
+	const previous = state.childrenTiming.get(taskId);
+	if (valid) {
+		if (previous !== undefined && previous.generationMs === valid.generationMs && previous.timedOutput === valid.timedOutput) return false;
+		state.childrenTiming.set(taskId, valid);
+		state.childTimingMs += valid.generationMs - (previous?.generationMs ?? 0);
+		state.childTimedOutput += valid.timedOutput - (previous?.timedOutput ?? 0);
+		return true;
+	}
+	if (previous === undefined) return false;
+	state.childrenTiming.delete(taskId);
+	state.childTimingMs -= previous.generationMs;
+	state.childTimedOutput -= previous.timedOutput;
+	return true;
+}
+
+/**
+ * Attach decode timing to an already-folded child — the disk backfill path for
+ * snapshots restored from older sessions or persisted before their session
+ * read succeeded. No-op for unknown tasks. Returns true when totals changed.
+ */
+export function setChildTiming(state: MeterState, taskId: string, timing: ChildTiming): boolean {
+	if (!state.children.has(taskId)) return false;
+	return applyChildTiming(state, taskId, timing);
 }
 
 /**
@@ -239,7 +299,13 @@ export function applyChildSnapshot(state: MeterState, data: unknown): boolean {
 	const wallMs = typeof candidate.wallMs === "number" && Number.isFinite(candidate.wallMs)
 		? Math.max(0, Math.round(candidate.wallMs))
 		: 0;
-	return setChild(state, candidate.taskId, usage, wallMs);
+	// Persisted timing rides the same plausibility gate as wall time; a
+	// degenerate value leaves the child untimed instead of poisoning avg.
+	let timing: ChildTiming | undefined;
+	const timingMs = typeof candidate.timingMs === "number" && Number.isFinite(candidate.timingMs) ? sanitizeWall(candidate.timingMs) : 0;
+	const timedOutput = typeof candidate.timedOutput === "number" && Number.isFinite(candidate.timedOutput) ? Math.max(0, Math.round(candidate.timedOutput)) : 0;
+	if (timingMs > 0 && timedOutput > 0) timing = { generationMs: timingMs, timedOutput };
+	return setChild(state, candidate.taskId, usage, wallMs, timing);
 }
 
 function validSnapshotPayload(data: unknown): data is ChildSnapshotData {
@@ -274,13 +340,14 @@ export function foldChildEntries(state: MeterState, entries: readonly unknown[] 
 	return folded;
 }
 
-/** Drop one subagent task's tokens and wall time after a revocation. Returns true if it was stored. */
+/** Drop one subagent task's tokens, wall time, and decode timing after a revocation. Returns true if it was stored. */
 export function dropChild(state: MeterState, taskId: string): boolean {
 	const wallMs = state.childrenMs.get(taskId);
 	if (wallMs !== undefined) {
 		state.childrenMs.delete(taskId);
 		state.subagentMs -= wallMs;
 	}
+	applyChildTiming(state, taskId);
 	if (!state.children.delete(taskId)) return false;
 	state.subagents -= 1;
 	return true;
@@ -346,9 +413,12 @@ export interface Rates {
 export function rates(state: MeterState, now: number, charsPerToken = 4): Rates {
 	const liveMs = state.liveStartedAt === undefined ? 0 : Math.max(0, now - state.liveStartedAt);
 	const live = liveMs >= 250 && state.liveChars > 0 ? (state.liveChars / charsPerToken) / (liveMs / 1000) : undefined;
-	const average = state.generationMs >= 250 && state.timedOutput > 0
-		? state.timedOutput / (state.generationMs / 1000)
-		: undefined;
+	// Session average over every timed agent: parent + settled children.
+	// Children with unreadable or missing timing contribute tokens but not
+	// time, so the average stays over the timed subset — never a guess.
+	const generationMs = state.generationMs + state.childTimingMs;
+	const timedOutput = state.timedOutput + state.childTimedOutput;
+	const average = generationMs >= 250 && timedOutput > 0 ? timedOutput / (generationMs / 1000) : undefined;
 	let childOutput = 0;
 	for (const child of state.children.values()) childOutput += child.output;
 	const subagent = state.subagentMs >= 250 && childOutput > 0 ? childOutput / (state.subagentMs / 1000) : undefined;
