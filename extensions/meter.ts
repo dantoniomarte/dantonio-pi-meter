@@ -165,7 +165,6 @@ export default function meterExtension(pi: ExtensionAPI): void {
 			if (parentStreaming) paint();
 		}, TICK_MS);
 	}
-	}
 
 	function stopTick(): void {
 		if (!timer) return;
